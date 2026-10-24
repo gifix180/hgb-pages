@@ -1,0 +1,65 @@
+name: Relevé PMU
+# Relevé PMU du jour (réunions en France), chiffré avec le mot de passe (secret HGB_MOT_DE_PASSE) dans pmu.enc, lu par
+# la page. GitHub ne lance les tâches programmées que très irrégulièrement (3 fois par jour au lieu de 30 les 23-24/10) :
+# une seule exécution fait donc une BOUCLE (relevé toutes les 15 min pendant ~5 h 40), puis se relance elle-même ;
+# arrêt la nuit (23 h → 8 h, heure de Paris). Redémarrage le matin : dépôt de la page par le suivi (push) ou horaires.
+# Un seul commit gardé (pas d'historique qui grossit).
+on:
+  push:                       # dépôt de la page du matin (dépôt privé, après chaque passage du suivi) : redémarre la chaîne
+    branches: [main]
+    paths: [index.html]
+  schedule:
+    - cron: "7 6 * * *"
+    - cron: "37 7 * * *"
+    - cron: "7 10 * * *"
+    - cron: "7 13 * * *"
+    - cron: "7 16 * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: releve
+  cancel-in-progress: false
+jobs:
+  releve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: python -m pip install cryptography
+      - name: Relevés toutes les 15 minutes
+        env:
+          HGB_MOT_DE_PASSE: ${{ secrets.HGB_MOT_DE_PASSE }}
+        run: |
+          git config user.name "hgb-bot"; git config user.email "hgb-bot@users.noreply.github.com"
+          publier() {
+            for i in 1 2 3 4 5; do
+              git fetch -q --depth 1 origin main && git checkout -q -B main origin/main && git reset -q --hard origin/main
+              BASE=$(git rev-parse HEAD)
+              cp /tmp/pmu.enc pmu.enc
+              git checkout -q --orphan neuf && git add -A
+              git commit -q -m "Relevé PMU $(TZ=Europe/Paris date +%F' '%H:%M)" || { git checkout -q main; git branch -D neuf -q; return 0; }
+              if git push -q --force-with-lease=main:$BASE origin neuf:main; then git checkout -q -B main origin/main 2>/dev/null; git branch -D neuf -q 2>/dev/null; echo "relevé publié $(TZ=Europe/Paris date +%H:%M)"; return 0; fi
+              git checkout -q main; git branch -D neuf -q; sleep 20
+            done
+            return 1
+          }
+          fin=$(( $(date +%s) + 340 * 60 ))
+          while :; do
+            h=$(TZ=Europe/Paris date +%-H)
+            if [ "$h" -ge 23 ] || [ "$h" -lt 8 ]; then echo "nuit : arrêt de la chaîne"; echo "nuit" > /tmp/nuit; break; fi
+            if python releve.py; then cp pmu.enc /tmp/pmu.enc && publier || echo "::warning::publication échouée"; else echo "::warning::relevé PMU échoué"; fi
+            [ "$(date +%s)" -gt "$fin" ] && break
+            sleep 900
+          done
+      - name: Relancer la chaîne
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -f /tmp/nuit ]; then echo "nuit : pas de relance (redémarrage par les horaires du matin)"; exit 0; fi
+          gh workflow run releve.yml --ref main -R "$GITHUB_REPOSITORY" && echo "chaîne relancée"
